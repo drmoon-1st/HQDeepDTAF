@@ -1,8 +1,8 @@
-# SupCon-MPL-DP: Supervised Contrastive Learning with Meta Pseudo Labels for Deepfake Image Detection
+# Hybrid quantum neural network, Protein-ligand binding affinity, Quantum neural network, Universal approximation theory
 
 <img src="./imgs/MainFigure2.pdf">
 
-#### SupCon-MPL-DP: Supervised Contrastive Learning with Meta Pseudo Labels for Deepfake Image Detection
+#### Hybrid quantum neural network, Protein-ligand binding affinity, Quantum neural network, Universal approximation theory
 
 Seon-Geun Jeong<sup>1</sup>, Kyeong-Hwan Moon<sup>2</sup> and Won-Joo Hwang<sup>1,2,*</sup>
 
