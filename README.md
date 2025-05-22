@@ -1,6 +1,6 @@
 # SupCon-MPL-DP: Supervised Contrastive Learning with Meta Pseudo Labels for Deepfake Image Detection
 
-<img src="./imgs/MainFigure/pdf">
+<img src="./imgs/MainFigure.pdf">
 
 #### SupCon-MPL-DP: Supervised Contrastive Learning with Meta Pseudo Labels for Deepfake Image Detection
 
