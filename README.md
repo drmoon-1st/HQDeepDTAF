@@ -1,6 +1,6 @@
 # Hybrid quantum neural network, Protein-ligand binding affinity, Quantum neural network, Universal approximation theory
 
-<img src="./imgs/MainFigure2.pdf">
+<img src="./imgs/MainFigure2.png">
 
 #### Hybrid quantum neural network, Protein-ligand binding affinity, Quantum neural network, Universal approximation theory
 
