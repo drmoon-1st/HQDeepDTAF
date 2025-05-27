@@ -1,0 +1,455 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+import metrics
+
+from dataset import PT_FEATURE_SIZE
+
+import pennylane as qml
+from functools import partial
+from math import ceil
+
+CHAR_SMI_SET_LEN = 64
+
+class DeepDTA(nn.Module):
+    def __init__(self,
+                 smi_embed_size=128,
+                 seq_embed_size=128,
+                 num_filters=64,
+                 smi_filter_sizes=[4, 6, 8],
+                 seq_filter_sizes=[3, 5, 7],
+                 dropout=0.5):
+        super(DeepDTA, self).__init__()
+
+        self.smi_embed = nn.Embedding(num_embeddings=CHAR_SMI_SET_LEN,
+                                      embedding_dim=smi_embed_size,
+                                      padding_idx=0)
+
+        self.seq_embed = nn.Linear(PT_FEATURE_SIZE, seq_embed_size)
+
+        # SMILES conv
+        self.smi_convs = nn.ModuleList([
+            nn.Conv1d(smi_embed_size, num_filters, kernel_size=k)
+            for k in smi_filter_sizes
+        ])
+
+        # Protein sequence conv
+        self.seq_convs = nn.ModuleList([
+            nn.Conv1d(seq_embed_size, num_filters, kernel_size=k)
+            for k in seq_filter_sizes
+        ])
+
+        # Packet-level input shares the same conv as sequence input
+        self.pkt_convs = nn.ModuleList([
+            nn.Conv1d(seq_embed_size, num_filters, kernel_size=k)
+            for k in seq_filter_sizes
+        ])
+
+        combined_dim = len(smi_filter_sizes + seq_filter_sizes + seq_filter_sizes) * num_filters
+
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(combined_dim, 1024),
+            nn.Dropout(dropout),
+            nn.PReLU(),
+            nn.Linear(1024, 512),
+            nn.Dropout(dropout),
+            nn.PReLU(),
+            nn.Linear(512, 1),
+            nn.PReLU()
+        )
+
+    def conv_block(self, x, convs):
+        # x: (batch, seq_len, emb_dim)
+        x = x.permute(0, 2, 1)  # (batch, emb_dim, seq_len)
+        out = [F.relu(conv(x)) for conv in convs]
+        out = [F.adaptive_max_pool1d(o, 1).squeeze(2) for o in out]
+        return torch.cat(out, dim=1)
+
+    def forward(self, seq, pkt, smi):
+        # seq, pkt: (B, L, 43), smi: (B, L)
+        seq_embed = self.seq_embed(seq)  # (B, L, 128)
+        pkt_embed = self.seq_embed(pkt)  # shared embed layer
+        smi_embed = self.smi_embed(smi)  # (B, L, 128)
+
+        seq_feat = self.conv_block(seq_embed, self.seq_convs)
+        pkt_feat = self.conv_block(pkt_embed, self.pkt_convs)
+        smi_feat = self.conv_block(smi_embed, self.smi_convs)
+
+        feat = torch.cat([seq_feat, pkt_feat, smi_feat], dim=1)
+        feat = self.dropout(feat)
+
+        return self.classifier(feat)
+
+
+def test(model: nn.Module, test_loader, loss_function, device, show):
+    model.eval()
+    test_loss = 0
+    outputs = []
+    targets = []
+    with torch.no_grad():
+        for idx, (*x, y) in tqdm(enumerate(test_loader), disable=not show, total=len(test_loader)):
+            for i in range(len(x)):
+                x[i] = x[i].to(device)
+            y = y.to(device)
+
+            y_hat = model(*x)
+
+            test_loss += loss_function(y_hat.view(-1), y.view(-1)).item()
+            outputs.append(y_hat.cpu().numpy().reshape(-1))
+            targets.append(y.cpu().numpy().reshape(-1))
+
+    targets = np.concatenate(targets).reshape(-1)
+    outputs = np.concatenate(outputs).reshape(-1)
+
+    test_loss /= len(test_loader.dataset)
+
+    evaluation = {
+        'loss': test_loss,
+        'c_index': metrics.c_index(targets, outputs),
+        'RMSE': metrics.RMSE(targets, outputs),
+        'MAE': metrics.MAE(targets, outputs),
+        'SD': metrics.SD(targets, outputs),
+        'CORR': metrics.CORR(targets, outputs),
+    }
+
+    return evaluation
+
+
+class Pafnucy(nn.Module):
+    def __init__(self,
+                 isize=20,             # spatial size (e.g., 20x20x20)
+                 in_chnls=19,          # number of input channels (features per voxel)
+                 osize=1,
+                 conv_patch=5,
+                 pool_patch=2,
+                 conv_channels=[64, 128, 256],
+                 dense_sizes=[1000, 500, 200],
+                 dropout=0.5):
+        super(Pafnucy, self).__init__()
+
+        self.conv_layers = nn.ModuleList()
+        self.pool = nn.MaxPool3d(kernel_size=pool_patch)
+
+        in_channels = in_chnls
+        for out_channels in conv_channels:
+            self.conv_layers.append(
+                nn.Conv3d(in_channels, out_channels, kernel_size=conv_patch, padding=0)
+            )
+            in_channels = out_channels
+
+        # Compute flattened feature size after convs and pooling
+        hfsize = isize
+        for _ in conv_channels:
+            hfsize = ceil((hfsize - conv_patch + 1) / pool_patch)
+        self.flattened_size = hfsize ** 3 * conv_channels[-1]
+
+        # Fully connected layers
+        fc_layers = []
+        in_dim = self.flattened_size
+        for dim in dense_sizes:
+            fc_layers.append(nn.Linear(in_dim, dim))
+            fc_layers.append(nn.ReLU())
+            fc_layers.append(nn.Dropout(dropout))
+            in_dim = dim
+        self.fc = nn.Sequential(*fc_layers)
+
+        self.out = nn.Linear(dense_sizes[-1], osize)
+
+    def forward(self, seq, pkt=None, smi=None):
+        """
+        Use `seq` as 3D input volume.
+        pkt, smi are ignored here to stay consistent with the interface.
+        """
+
+        x = seq  # expected shape: (B, C, D, H, W)
+        print(seq.shape)
+        for conv in self.conv_layers:
+            x = F.relu(conv(x))
+            x = self.pool(x)
+
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return self.out(x)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TopologyNet(nn.Module):
+    def __init__(self,
+                 n_channels: int,             # e.g., 40
+                 seq_len: int,                # e.g., 1000
+                 conv_channels: list = [64, 128, 256],
+                 kernel_sizes: list = [3, 3, 3],
+                 pool_sizes: list = [2, 2, 2],
+                 fc_dims: list = [1024, 512],
+                 tasks: list = ['affinity']   # or multiple tasks
+                 ):
+        super(TopologyNet, self).__init__()
+        assert len(conv_channels) == len(kernel_sizes) == len(pool_sizes)
+
+        self.conv_layers = nn.ModuleList()
+        in_ch = n_channels
+        for out_ch, k, p in zip(conv_channels, kernel_sizes, pool_sizes):
+            self.conv_layers.append(nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=p)
+            ))
+            in_ch = out_ch
+
+        def compute_output_length(L):
+            for k, p in zip(kernel_sizes, pool_sizes):
+                L = (L + (k // 2) * 2 - (k - 1) - 1) + 1  # conv1d output size
+                L = L // p
+            return L
+
+        final_len = compute_output_length(seq_len)
+        flattened_dim = in_ch * final_len
+
+        # Shared FC
+        fc_layers = []
+        in_dim = flattened_dim
+        for dim in fc_dims:
+            fc_layers.extend([
+                nn.Linear(in_dim, dim),
+                nn.ReLU(),
+                nn.Dropout(0.5)
+            ])
+            in_dim = dim
+        self.shared_fc = nn.Sequential(*fc_layers)
+
+        # Task-specific heads
+        self.heads = nn.ModuleDict({
+            t: nn.Linear(in_dim, 1) for t in tasks
+        })
+        self.task_list = tasks
+
+    def forward(self, x, pkt=None, smi=None):
+        """
+        x: Tensor of shape (batch, seq_len, channels) → permuted to (B, C, L)
+        Returns: dict of predictions if multi-task, else Tensor
+        """
+        x = x.permute(0, 2, 1)  # (B, C, L) for Conv1d
+
+        for conv in self.conv_layers:
+            x = conv(x)
+
+        x = x.view(x.size(0), -1)
+        x = self.shared_fc(x)
+
+        outputs = {t: self.heads[t](x).squeeze(-1) for t in self.task_list}
+        return outputs if len(outputs) > 1 else list(outputs.values())[0]
+
+#########################
+
+from collections import OrderedDict
+from typing import List, Optional
+
+import torch
+from torch import nn
+
+
+class AtomicNN(nn.Module):
+    """
+    Atomic Neural Network (ANN)
+
+    Parameters
+    ----------
+    n_inputs: int
+        Input size (AEVs length)
+    layers_sizes: List[int]
+        List with the size of fully connected layers, excluding firs
+    dropp: Optional[float]
+        Dropout probability
+    """
+
+    def __init__(
+        self,
+        n_inputs: int,
+        layers_sizes: Optional[List[int]] = None,
+        dropp: Optional[float] = None,
+    ):
+
+        super().__init__()
+
+        if layers_sizes is None:
+            # Default values from TorchANI turorial
+            self.layers_sizes: List[int] = [160, 128, 96, 1]
+        else:
+            self.layers_sizes = layers_sizes.copy()
+
+        # Prepend input size to other layer sizes
+        self.layers_sizes.insert(0, n_inputs)
+
+        self.layers = nn.ModuleList()
+
+        for in_size, out_size in zip(self.layers_sizes[:-2], self.layers_sizes[1:-1]):
+            self.layers.append(nn.Linear(in_size, out_size))
+            self.layers.append(nn.ReLU())
+
+            if dropp is not None:
+                self.layers.append(nn.Dropout(dropp))
+
+        # Last linear layer
+        self.layers.append(nn.Linear(self.layers_sizes[-2], self.layers_sizes[-1]))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+
+        return x
+
+
+class AffinityModel(nn.ModuleDict):
+    """
+    Affinity prediction from AEVs.
+
+    Parameters
+    ----------
+    n_species: int
+        Number of species
+    aev_length: int
+        Length of the atomic environment vectors
+    layers_sizes: Optional[List[int]] = None
+        Layers' dimensions for each atomic NN
+    dropp: Optional[float]
+        Dropout probability
+
+    Notes
+    -----
+    The AffinityModel is implemented closely following the TorchANI implementation,
+    which is released under the MIT license.
+
+    .. note::
+       Copyright 2018-2020 Xiang Gao and other ANI developers.
+
+       Permission is hereby granted, free of charge, to any person obtaining a copy of
+       this software and associated documentation files (the "Software"), to deal in
+       the Software without restriction, including without limitation the rights to
+       use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+       of the Software, and to permit persons to whom the Software is furnished to do
+       so, subject to the following conditions:
+
+       The above copyright notice and this permission notice shall be included in all
+       copies or substantial portions of the Software.
+
+       THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+       IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+       FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+       AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+       LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+       OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+       SOFTWARE.
+    """
+
+    def __init__(
+        self,
+        n_species: int,
+        aev_length: int,
+        layers_sizes: Optional[List[int]] = None,
+        dropp: Optional[float] = None,
+    ):
+
+        assert n_species > 0
+
+        modules = n_species * [
+            AtomicNN(aev_length, layers_sizes=layers_sizes, dropp=dropp)
+        ]
+
+        super().__init__(self.ensureOrderedDict(modules))
+
+        # Store values
+        self.aev_length = aev_length
+        self.n_species = n_species
+        self.dropp = dropp
+        self.layers_sizes = modules[0].layers_sizes
+
+    def _forward_atomic(self, species, aevs, ligmasks=None):
+        """
+        Forward pass for individual atomic environments.
+
+        Parameters
+        ----------
+        species: torch.Tensor
+            Species
+        aevs: torch.Tensor
+            Atomic environment vectors
+        ligmasks: torch.Tensor
+            Masks for ligand atoms
+
+        Returns
+        -------
+        torch.Tensor
+            Atomic contributions (unmasked)
+
+        Notes
+        -----
+        Copyright 2018-2020 Xiang Gao and other ANI developers.
+
+        This is extracted from the original code and computes
+        forward pass without aggregation.
+
+        Atomic contributions are not masked by ligand atoms. However, when a ligand
+        mask is used non-ligand contributions are set to zero and therefore they do
+        not contribute to the final sum.
+        """
+        if ligmasks is not None:
+            species_ = species.clone()
+            species_[~ligmasks] = -1
+        else:
+            species_ = species
+
+        species_ = species_.flatten()
+        aevs = aevs.flatten(0, 1)
+
+        # size of species_ but same dtype and device of aevs
+        output = aevs.new_zeros(species_.shape)
+
+        for i, (_, m) in enumerate(self.items()):
+            mask = species_ == i
+            midx = mask.nonzero().flatten()
+            if midx.shape[0] > 0:
+                input_ = aevs.index_select(0, midx)
+                output.masked_scatter_(mask, m(input_).flatten())
+        output = output.view_as(species)
+
+        return output
+
+    def forward(self, species, aevs, ligmasks=None):
+        """
+        Parameters
+        ----------
+        species: torch.Tensor
+            Species
+        aevs: torch.Tensor
+            Atomic environment vectors
+        ligmasks: torch.Tensor
+            Masks for ligand atoms
+
+        Returns
+        -------
+        torch.Tensor
+            Model output (affinity predictions)
+        """
+        output = self._forward_atomic(species, aevs, ligmasks)
+        return torch.sum(output, dim=1)
+
+    @staticmethod
+    def ensureOrderedDict(modules):
+        """
+        Ensure ordered dictionary (for old-ish Python versions)
+
+        Notes
+        -----
+        Copyright 2018-2020 Xiang Gao and other ANI developers.
+        """
+        if isinstance(modules, OrderedDict):
+            return modules
+        od = OrderedDict()
+        for i, m in enumerate(modules):
+            od[str(i)] = m
+        return od
