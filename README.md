@@ -10,6 +10,11 @@ Seon-Geun Jeong<sup>1</sup>, Kyeong-Hwan Moon<sup>2</sup> and Won-Joo Hwang<sup>
 
 ## Results
 
-<img src="./imgs/result1.png" witdh=60>
+<p align="center">
+  <img src="./imgs/result1.png" width="60%">
+</p>
 
-<img src="./imgs/result2.png">
+<p align="center">
+  <img src="./imgs/result2.png" width="60%">
+</p>
+
