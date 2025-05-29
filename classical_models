@@ -117,63 +117,6 @@ def test(model: nn.Module, test_loader, loss_function, device, show):
 
     return evaluation
 
-
-class Pafnucy(nn.Module):
-    def __init__(self,
-                 isize=20,             # spatial size (e.g., 20x20x20)
-                 in_chnls=19,          # number of input channels (features per voxel)
-                 osize=1,
-                 conv_patch=5,
-                 pool_patch=2,
-                 conv_channels=[64, 128, 256],
-                 dense_sizes=[1000, 500, 200],
-                 dropout=0.5):
-        super(Pafnucy, self).__init__()
-
-        self.conv_layers = nn.ModuleList()
-        self.pool = nn.MaxPool3d(kernel_size=pool_patch)
-
-        in_channels = in_chnls
-        for out_channels in conv_channels:
-            self.conv_layers.append(
-                nn.Conv3d(in_channels, out_channels, kernel_size=conv_patch, padding=0)
-            )
-            in_channels = out_channels
-
-        # Compute flattened feature size after convs and pooling
-        hfsize = isize
-        for _ in conv_channels:
-            hfsize = ceil((hfsize - conv_patch + 1) / pool_patch)
-        self.flattened_size = hfsize ** 3 * conv_channels[-1]
-
-        # Fully connected layers
-        fc_layers = []
-        in_dim = self.flattened_size
-        for dim in dense_sizes:
-            fc_layers.append(nn.Linear(in_dim, dim))
-            fc_layers.append(nn.ReLU())
-            fc_layers.append(nn.Dropout(dropout))
-            in_dim = dim
-        self.fc = nn.Sequential(*fc_layers)
-
-        self.out = nn.Linear(dense_sizes[-1], osize)
-
-    def forward(self, seq, pkt=None, smi=None):
-        """
-        Use `seq` as 3D input volume.
-        pkt, smi are ignored here to stay consistent with the interface.
-        """
-
-        x = seq  # expected shape: (B, C, D, H, W)
-        print(seq.shape)
-        for conv in self.conv_layers:
-            x = F.relu(conv(x))
-            x = self.pool(x)
-
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return self.out(x)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
